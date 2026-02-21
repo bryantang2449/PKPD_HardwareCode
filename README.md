@@ -67,46 +67,109 @@ Install the following libraries via Arduino IDE Library Manager or manually:
 - `WiFi` (built-in) — Wi-Fi connectivity
 - `HTTPClient` (built-in) — HTTP requests to the backend server
 
-### TFT_eSPI Configuration
+### 1. Initialization
 
-You need to configure `TFT_eSPI` for the ILI9488 display. Edit the `User_Setup.h` file in the library folder:
+On power-up, the system:
+- Connects to Wi-Fi
+- Initializes the ILI9488 LCD via SPI
+- Starts the NEO-6M GPS module via Serial
+- Configures 4 button pins as inputs
+- Displays the main menu screen
 
 ```cpp
-#define ILI9488_DRIVER
-#define TFT_MISO 19
-#define TFT_MOSI 23
-#define TFT_SCLK 18
-#define TFT_CS   15
-#define TFT_DC    2
-#define TFT_RST   4
+#define BUTTON_FORWARD 14
+#define BUTTON_BACK    27
+#define BUTTON_UP      12
+#define BUTTON_DOWN    13
 ```
 
-> **Note:** Pin assignments may vary depending on your wiring. Check your circuit connections.
+### 2. Main Menu & Button Navigation
 
-## Setup & Usage
+The main menu offers 4 options. Users navigate using physical buttons:
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/bryantang2449/PKPD_HardwareCode.git
-   ```
+| Button | GPIO | Function |
+|---|---|---|
+| **Forward** (Enter) | GPIO 14 | Select / confirm a menu option |
+| **Back** | GPIO 27 | Return to the main menu |
+| **Up** | GPIO 12 | Scroll up / zoom in / previous page |
+| **Down** | GPIO 13 | Scroll down / zoom out / next page |
 
-2. **Open `finalcode.ino`** in Arduino IDE
+```
+Main Menu
+├── KMB ETA          → Nearby KMB bus stop arrival times
+├── GMB ETA          → Nearby Green Minibus arrival times
+├── View Map         → Google Static Map with position & facilities
+└── Weather Info     → Warnings, reports & forecasts
+```
 
-3. **Configure Wi-Fi credentials** — Update the SSID and password in the code to connect to your network
+### 3. GPS Data Acquisition
 
-4. **Configure server URL** — Update the backend server URL to point to your running instance of [pkpd-server](https://github.com/Cinnoline/pkpd-server)
+The ESP32 reads NMEA data from the NEO-6M GPS module over a hardware serial connection. Once a satellite fix is obtained (typically 1–2 min in open areas), the latitude and longitude are used to:
 
-5. **Select board** — Choose `ESP32 Dev Module` in Arduino IDE under Tools → Board
+- Request nearby bus stops, facilities, and weather from the backend
+- Render the current position on a Google Static Map
+- Send coordinates to the server via POST request every 1 minute for safety tracking
 
-6. **Upload** — Connect the ESP32 via USB and upload the code
+### 4. Fetching & Displaying Data
 
-7. **Use outdoors** — GPS module requires a clear view of the sky. First fix typically takes 1–2 minutes in open areas.
+Each menu option triggers HTTP GET requests to the Express.js backend:
+
+```
+User selects "KMB ETA"
+        │
+        ▼
+ESP32 sends GET /transport/kmbStops/nearest?lat=...&long=...
+        │
+        ▼
+Server queries MongoDB + real-time KMB API
+        │
+        ▼
+Returns formatted string response
+        │
+        ▼
+ESP32 parses response and renders on LCD with pagination
+```
+
+**Key implementation details:**
+
+- **Auto-refresh:** Map refreshes every **5 seconds**, bus ETAs refresh every **30 seconds**
+- **Pagination:** When data exceeds one screen, Up/Down buttons scroll through pages
+- **Word-wrapping:** Custom logic wraps long text (especially weather reports) to fit the LCD width, avoiding mid-word line breaks
+- **JSON formatting:** Complex JSON responses are pre-formatted on the server side to reduce parsing load on the ESP32
+
+### 5. Safety Monitoring
+
+The ESP32 periodically sends its GPS coordinates to the server:
+
+```
+ESP32  ───POST /location/track───►  Server
+       { time, location: [lng, lat] }
+```
+
+The server compares incoming coordinates using the **Haversine formula**. If the hiker stays within 100 meters for over **4 hours**, the server triggers an email alert via Nodemailer to the predefined emergency contact, containing:
+- Last known coordinates
+- A direct Google Maps link to the location
+
+After the initial alert, follow-up emails are sent every hour.
+
+### 6. Map Display & Zoom
+
+The map feature requests a Google Static Maps URL from the backend, which includes markers for:
+- 📍 Current hiker position
+- 🚌 Nearby KMB bus stops
+- 🚐 Nearby GMB bus stops
+- 💧 Water filling stations
+- 🔥 BBQ areas
+
+The Up/Down buttons control zoom level, and the map image auto-refreshes every 5 seconds as the GPS position updates.
+
+---
 
 ## Pin Connections
 
 ```
-ESP32           ILI9488 LCD
-─────           ───────────
+ESP32           ILI9488 LCD (SPI)
+─────           ─────────────────
 3V3  ────────── VCC
 GND  ────────── GND
 GPIO 23 ─────── MOSI (SDA)
@@ -125,22 +188,25 @@ GPIO 17 ─────── RX
 
 ESP32           Buttons
 ─────           ───────
-GPIO 32 ─────── Up
-GPIO 33 ─────── Down
-GPIO 25 ─────── Enter
-GPIO 26 ─────── Back
+GPIO 14 ─────── Forward (Enter)
+GPIO 27 ─────── Back
+GPIO 12 ─────── Up
+GPIO 13 ─────── Down
 ```
 
-> **Note:** Pin assignments shown above are for reference. Please verify against your actual wiring and adjust the code if needed.
+> **Note:** Verify pin assignments against your actual wiring. The LCD SPI and GPS serial pins above are based on common ESP32 configurations — check the `#define` statements at the top of `finalcode.ino` for exact values.
+
+---
 
 ## API Endpoints Used
 
-The hardware client communicates with the backend server via HTTP GET/POST requests:
+The hardware client communicates with the backend server via HTTP:
 
 | Endpoint | Method | Description |
 |---|---|---|
 | `/weather/weather_forecast` | GET | Weather forecast text |
 | `/weather/warning_info` | GET | Current weather warnings |
+| `/weather/weather_report?lat=&long=` | GET | Weather report from nearest station |
 | `/transport/kmbStops/nearest?lat=&long=` | GET | Nearby KMB bus ETAs |
 | `/transport/gmbStops/nearest?lat=&long=` | GET | Nearby GMB bus ETAs |
 | `/map?lat=&long=` | GET | Google Static Map URL with facility markers |
@@ -148,24 +214,82 @@ The hardware client communicates with the backend server via HTTP GET/POST reque
 
 For the full API documentation, see the [server repository README](https://github.com/Cinnoline/pkpd-server#for-users).
 
+---
+
+## Prerequisites & Setup
+
+### Requirements
+
+- **Arduino IDE** — [Download](https://www.arduino.cc/en/software)
+- **ESP32 Board Manager** — Add `https://dl.espressif.com/dl/package_esp32_index.json` to Arduino IDE Board Manager URLs
+- **VCP Driver** — Install the USB-to-UART driver for your OS if needed
+
+### Required Libraries
+
+Install via Arduino IDE Library Manager:
+
+| Library | Purpose |
+|---|---|
+| `TFT_eSPI` | ILI9488 LCD display driver ([GitHub](https://github.com/Bodmer/TFT_eSPI)) |
+| `TinyGPSPlus` | GPS NMEA sentence parsing |
+| `ArduinoJson` | JSON parsing for API responses |
+| `WiFi` (built-in) | Wi-Fi connectivity |
+| `HTTPClient` (built-in) | HTTP requests to backend |
+
+### TFT_eSPI Configuration
+
+Edit `User_Setup.h` in the TFT_eSPI library folder to match the ILI9488:
+
+```cpp
+#define ILI9488_DRIVER
+#define TFT_MISO 19
+#define TFT_MOSI 23
+#define TFT_SCLK 18
+#define TFT_CS   15
+#define TFT_DC    2
+#define TFT_RST   4
+```
+
+### Upload Steps
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/bryantang2449/PKPD_HardwareCode.git
+   ```
+
+2. **Open `finalcode.ino`** in Arduino IDE
+
+3. **Configure Wi-Fi** — Update the SSID and password in the code
+
+4. **Configure server URL** — Update the backend URL to point to your running instance of [pkpd-server](https://github.com/Cinnoline/pkpd-server)
+
+5. **Select board** — `ESP32 Dev Module` under Tools → Board
+
+6. **Upload** — Connect ESP32 via USB and upload
+
+7. **Use outdoors** — GPS requires clear sky view. First fix takes 1–2 minutes.
+
+---
+
 ## Challenges & Lessons Learned
 
-- **GPS Module Quality** — 2 out of 3 purchased NEO-6M modules were defective; thorough testing of hardware components is critical
-- **Display Formatting Without Graphics Library** — All UI rendering was done manually without a graphics library (e.g., LVGL), requiring custom word-wrapping and pagination logic
-- **JSON Parsing on ESP32** — Complex JSON responses were reformatted on the server side to reduce client-side parsing overhead
-- **Color Calibration** — The ILI9488 required color correction as initial RGB values displayed inverted colors
+- **GPS Module Quality** — 2 out of 3 purchased NEO-6M modules were defective; always test hardware components early
+- **Display Formatting Without Graphics Library** — All UI rendering was done manually without LVGL or similar, requiring custom word-wrapping and pagination logic
+- **JSON Parsing on ESP32** — Complex responses were reformatted server-side to reduce client parsing overhead
+- **Color Calibration** — ILI9488 initially displayed inverted RGB values, requiring color correction
+- **Git Security** — Credentials were accidentally committed; we had to rewrite commit history using `git filter-repo`
+
+---
 
 ## Team & My Contribution
 
-This was a 4-person group project. My contributions (Tang Chun Leung / Bryan):
+This was a 4-person group project for CCIT4080. My contributions (Tang Chun Leung / Bryan):
 
-- **Hardware programming** — All ESP32 firmware including menu system, display rendering, GPS integration, and API communication
-- **UI design** — Button-driven navigation, pagination, auto-refresh logic, and word-wrapping
-- **Debugging** — Hardware troubleshooting, display calibration, and integration testing
+- **Hardware programming** — All ESP32 firmware: menu system, display rendering, GPS integration, API communication, auto-refresh, pagination
+- **UI design** — Button-driven navigation, screen layouts, word-wrapping logic
+- **Debugging** — Hardware troubleshooting, display calibration, end-to-end integration testing
 
-## License
-
-This project was developed as part of the CCIT4080 course at HKUSPACE Community College (2024–2025).
+---
 
 ## Acknowledgements
 
