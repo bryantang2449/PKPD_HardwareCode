@@ -67,7 +67,7 @@ Install the following libraries via Arduino IDE Library Manager or manually:
 - `WiFi` (built-in) — Wi-Fi connectivity
 - `HTTPClient` (built-in) — HTTP requests to the backend server
 
-### 1. Initialization
+### Initialization
 
 On power-up, the system:
 - Connects to Wi-Fi
@@ -76,92 +76,311 @@ On power-up, the system:
 - Configures 4 button pins as inputs
 - Displays the main menu screen
 
+## How the Code Works
+
+### Button & Pin Definitions
+
+Four physical buttons are mapped to GPIO pins for all user interaction:
+
 ```cpp
-#define BUTTON_FORWARD 14
-#define BUTTON_BACK    27
-#define BUTTON_UP      12
-#define BUTTON_DOWN    13
+#define BUTTON_FORWARD 14   // Enter / select menu option
+#define BUTTON_BACK    27   // Return to main menu
+#define BUTTON_UP      12   // Scroll up / zoom in / previous page
+#define BUTTON_DOWN    13   // Scroll down / zoom out / next page
 ```
 
-### 2. Main Menu & Button Navigation
+### Startup Flow
 
-The main menu offers 4 options. Users navigate using physical buttons:
+On power-up, the ESP32 performs the following initialization sequence:
 
-| Button | GPIO | Function |
-|---|---|---|
-| **Forward** (Enter) | GPIO 14 | Select / confirm a menu option |
-| **Back** | GPIO 27 | Return to the main menu |
-| **Up** | GPIO 12 | Scroll up / zoom in / previous page |
-| **Down** | GPIO 13 | Scroll down / zoom out / next page |
+```cpp
+void setup() {
+    Serial.begin(115200);
 
+    // 1. Initialize LCD display via SPI
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+
+    // 2. Initialize GPS module via hardware serial
+    gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+    // 3. Configure button pins
+    pinMode(BUTTON_FORWARD, INPUT_PULLUP);
+    pinMode(BUTTON_BACK, INPUT_PULLUP);
+    pinMode(BUTTON_UP, INPUT_PULLUP);
+    pinMode(BUTTON_DOWN, INPUT_PULLUP);
+
+    // 4. Connect to Wi-Fi
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+    }
+
+    // 5. Display main menu
+    drawMainMenu();
+}
 ```
-Main Menu
-├── KMB ETA          → Nearby KMB bus stop arrival times
-├── GMB ETA          → Nearby Green Minibus arrival times
-├── View Map         → Google Static Map with position & facilities
-└── Weather Info     → Warnings, reports & forecasts
+
+### Main Menu Navigation
+
+The menu system uses a state-based approach. The `loop()` reads button inputs and switches between screens:
+
+```cpp
+void loop() {
+    // Read GPS data continuously
+    while (gpsSerial.available()) {
+        gps.encode(gpsSerial.read());
+    }
+
+    // Handle button presses based on current screen
+    if (digitalRead(BUTTON_FORWARD) == LOW) {
+        switch (currentMenuItem) {
+            case 0: showKmbEta();     break;
+            case 1: showGmbEta();     break;
+            case 2: showMap();        break;
+            case 3: showWeather();    break;
+        }
+    }
+
+    if (digitalRead(BUTTON_BACK) == LOW) {
+        drawMainMenu();
+    }
+
+    if (digitalRead(BUTTON_UP) == LOW) {
+        handleUpButton();   // Scroll up / zoom in / prev page
+    }
+
+    if (digitalRead(BUTTON_DOWN) == LOW) {
+        handleDownButton(); // Scroll down / zoom out / next page
+    }
+}
 ```
 
-### 3. GPS Data Acquisition
+### GPS Data Reading
 
-The ESP32 reads NMEA data from the NEO-6M GPS module over a hardware serial connection. Once a satellite fix is obtained (typically 1–2 min in open areas), the latitude and longitude are used to:
+The NEO-6M module outputs NMEA sentences over serial. `TinyGPSPlus` parses them into usable coordinates:
 
-- Request nearby bus stops, facilities, and weather from the backend
-- Render the current position on a Google Static Map
-- Send coordinates to the server via POST request every 1 minute for safety tracking
+```cpp
+#include <TinyGPS++.h>
 
-### 4. Fetching & Displaying Data
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);  // Use UART1
 
-Each menu option triggers HTTP GET requests to the Express.js backend:
+// In loop — continuously feed GPS data
+while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+}
+
+// Once a valid fix is obtained
+if (gps.location.isValid()) {
+    float latitude  = gps.location.lat();  // e.g. 22.3849
+    float longitude = gps.location.lng();  // e.g. 114.1438
+}
+```
+
+### HTTP Requests to Backend
+
+The ESP32 uses `HTTPClient` to fetch data from the Express.js server. Example — fetching nearby KMB bus ETAs:
+
+```cpp
+#include <HTTPClient.h>
+
+String fetchData(String endpoint) {
+    HTTPClient http;
+    String url = serverBaseUrl + endpoint;
+    http.begin(url);
+
+    int httpCode = http.GET();
+    String payload = "";
+
+    if (httpCode == HTTP_CODE_OK) {
+        payload = http.getString();
+    }
+
+    http.end();
+    return payload;
+}
+
+// Usage — pass current GPS coordinates
+String kmbData = fetchData(
+    "/transport/kmbStops/nearest?lat=" + String(latitude, 6) +
+    "&long=" + String(longitude, 6)
+);
+```
+
+The request-response flow:
 
 ```
 User selects "KMB ETA"
         │
         ▼
-ESP32 sends GET /transport/kmbStops/nearest?lat=...&long=...
+ESP32 sends GET /transport/kmbStops/nearest?lat=22.3849&long=114.1438
         │
         ▼
-Server queries MongoDB + real-time KMB API
+Server queries MongoDB for nearby stops (Haversine formula, 3km radius)
+  + fetches real-time ETA from KMB open data API
         │
         ▼
-Returns formatted string response
+Returns pre-formatted string response
         │
         ▼
-ESP32 parses response and renders on LCD with pagination
+ESP32 renders text on LCD with pagination
 ```
 
-**Key implementation details:**
+### Sending GPS Location (POST)
 
-- **Auto-refresh:** Map refreshes every **5 seconds**, bus ETAs refresh every **30 seconds**
-- **Pagination:** When data exceeds one screen, Up/Down buttons scroll through pages
-- **Word-wrapping:** Custom logic wraps long text (especially weather reports) to fit the LCD width, avoiding mid-word line breaks
-- **JSON formatting:** Complex JSON responses are pre-formatted on the server side to reduce parsing load on the ESP32
+Every 1 minute, the ESP32 sends its current position to the server for safety tracking:
 
-### 5. Safety Monitoring
+```cpp
+void sendLocationToServer() {
+    HTTPClient http;
+    http.begin(serverBaseUrl + "/location/track");
+    http.addHeader("Content-Type", "application/json");
 
-The ESP32 periodically sends its GPS coordinates to the server:
+    // Build JSON body
+    String body = "{\"time\":" + String(gps.time.value()) +
+                  ",\"location\":[" + String(longitude, 6) + "," +
+                  String(latitude, 6) + "]}";
+
+    int httpCode = http.POST(body);
+    http.end();
+}
+```
+
+The server compares this with previous coordinates. If the hiker stays within **100 meters** for over **4 hours**, an alert email is sent automatically. After the first alert, follow-up emails are sent every hour.
+
+### Map Display & Zoom
+
+The map feature fetches a Google Static Maps URL from the backend, which includes markers for nearby facilities:
+
+```cpp
+void showMap() {
+    String mapUrl = fetchData(
+        "/map?lat=" + String(latitude, 6) +
+        "&long=" + String(longitude, 6)
+    );
+
+    // Download the map image and display on LCD
+    downloadAndDisplayImage(mapUrl);
+}
+```
+
+- **Up button** → increments zoom level
+- **Down button** → decrements zoom level
+- Map **auto-refreshes every 5 seconds** as GPS position updates
+
+The map displays markers for: current hiker position, nearby KMB stops, GMB stops, water filling stations, and BBQ areas.
+
+### Auto-Refresh Logic
+
+Different screens refresh at different intervals to balance usability and network usage:
+
+```cpp
+unsigned long lastMapRefresh = 0;
+unsigned long lastEtaRefresh = 0;
+
+void loop() {
+    unsigned long now = millis();
+
+    // Map auto-refresh every 5 seconds
+    if (currentScreen == SCREEN_MAP && now - lastMapRefresh > 5000) {
+        refreshMap();
+        lastMapRefresh = now;
+    }
+
+    // Bus ETA auto-refresh every 30 seconds
+    if ((currentScreen == SCREEN_KMB || currentScreen == SCREEN_GMB)
+        && now - lastEtaRefresh > 30000) {
+        refreshEta();
+        lastEtaRefresh = now;
+    }
+}
+```
+
+### Word-Wrapping for LCD Display
+
+Weather reports can be lengthy. A custom word-wrapping function ensures text fits the LCD width without breaking mid-word:
+
+```cpp
+void drawWrappedText(String text, int x, int y, int maxWidth) {
+    String line = "";
+    int cursorY = y;
+
+    for (int i = 0; i < text.length(); i++) {
+        line += text[i];
+
+        // Check if current line exceeds display width
+        if (tft.textWidth(line) > maxWidth) {
+            // Find last space to break at word boundary
+            int lastSpace = line.lastIndexOf(' ');
+            if (lastSpace > 0) {
+                String printLine = line.substring(0, lastSpace);
+                tft.drawString(printLine, x, cursorY);
+                line = line.substring(lastSpace + 1);
+            } else {
+                tft.drawString(line, x, cursorY);
+                line = "";
+            }
+            cursorY += tft.fontHeight();
+        }
+    }
+
+    // Print remaining text
+    if (line.length() > 0) {
+        tft.drawString(line, x, cursorY);
+    }
+}
+```
+
+### Pagination
+
+When data exceeds one screen (e.g., many bus routes), pagination splits content into pages:
+
+```cpp
+int currentPage = 0;
+int totalPages = 0;
+
+void displayWithPagination(String lines[], int totalLines, int linesPerPage) {
+    totalPages = (totalLines + linesPerPage - 1) / linesPerPage;
+    int startIdx = currentPage * linesPerPage;
+    int endIdx = min(startIdx + linesPerPage, totalLines);
+
+    tft.fillScreen(TFT_BLACK);
+    int y = 10;
+
+    for (int i = startIdx; i < endIdx; i++) {
+        tft.drawString(lines[i], 10, y);
+        y += tft.fontHeight() + 4;
+    }
+
+    // Show page indicator
+    tft.drawString("Page " + String(currentPage + 1) + "/" + String(totalPages),
+                   10, tft.height() - 20);
+}
+
+// Up → previous page, Down → next page
+void handleUpButton() {
+    if (currentPage > 0) { currentPage--; refreshCurrentScreen(); }
+}
+void handleDownButton() {
+    if (currentPage < totalPages - 1) { currentPage++; refreshCurrentScreen(); }
+}
+```
+
+---
+
+## Menu Structure
 
 ```
-ESP32  ───POST /location/track───►  Server
-       { time, location: [lng, lat] }
+Main Menu
+├── KMB ETA          → Nearby KMB bus stop ETAs (paginated, auto-refresh 30s)
+├── GMB ETA          → Nearby GMB bus stop ETAs (paginated, auto-refresh 30s)
+├── View Map         → Google Static Map with position & nearby facilities
+│                      (zoom in/out, auto-refresh 5s)
+└── Weather Info     → Page 1: Warnings + Weather Report
+                       Page 2: Weather Forecast
 ```
-
-The server compares incoming coordinates using the **Haversine formula**. If the hiker stays within 100 meters for over **4 hours**, the server triggers an email alert via Nodemailer to the predefined emergency contact, containing:
-- Last known coordinates
-- A direct Google Maps link to the location
-
-After the initial alert, follow-up emails are sent every hour.
-
-### 6. Map Display & Zoom
-
-The map feature requests a Google Static Maps URL from the backend, which includes markers for:
-- 📍 Current hiker position
-- 🚌 Nearby KMB bus stops
-- 🚐 Nearby GMB bus stops
-- 💧 Water filling stations
-- 🔥 BBQ areas
-
-The Up/Down buttons control zoom level, and the map image auto-refreshes every 5 seconds as the GPS position updates.
 
 ---
 
@@ -194,13 +413,11 @@ GPIO 12 ─────── Up
 GPIO 13 ─────── Down
 ```
 
-> **Note:** Verify pin assignments against your actual wiring. The LCD SPI and GPS serial pins above are based on common ESP32 configurations — check the `#define` statements at the top of `finalcode.ino` for exact values.
+> **Note:** Verify pin assignments against your actual wiring. Check the `#define` statements at the top of `finalcode.ino` for exact values.
 
 ---
 
 ## API Endpoints Used
-
-The hardware client communicates with the backend server via HTTP:
 
 | Endpoint | Method | Description |
 |---|---|---|
@@ -226,8 +443,6 @@ For the full API documentation, see the [server repository README](https://githu
 
 ### Required Libraries
 
-Install via Arduino IDE Library Manager:
-
 | Library | Purpose |
 |---|---|
 | `TFT_eSPI` | ILI9488 LCD display driver ([GitHub](https://github.com/Bodmer/TFT_eSPI)) |
@@ -238,7 +453,7 @@ Install via Arduino IDE Library Manager:
 
 ### TFT_eSPI Configuration
 
-Edit `User_Setup.h` in the TFT_eSPI library folder to match the ILI9488:
+Edit `User_Setup.h` in the TFT_eSPI library folder:
 
 ```cpp
 #define ILI9488_DRIVER
@@ -256,17 +471,11 @@ Edit `User_Setup.h` in the TFT_eSPI library folder to match the ILI9488:
    ```bash
    git clone https://github.com/bryantang2449/PKPD_HardwareCode.git
    ```
-
 2. **Open `finalcode.ino`** in Arduino IDE
-
-3. **Configure Wi-Fi** — Update the SSID and password in the code
-
-4. **Configure server URL** — Update the backend URL to point to your running instance of [pkpd-server](https://github.com/Cinnoline/pkpd-server)
-
+3. **Configure Wi-Fi** — Update SSID and password in the code
+4. **Configure server URL** — Point to your running [pkpd-server](https://github.com/Cinnoline/pkpd-server) instance
 5. **Select board** — `ESP32 Dev Module` under Tools → Board
-
 6. **Upload** — Connect ESP32 via USB and upload
-
 7. **Use outdoors** — GPS requires clear sky view. First fix takes 1–2 minutes.
 
 ---
@@ -277,19 +486,13 @@ Edit `User_Setup.h` in the TFT_eSPI library folder to match the ILI9488:
 - **Display Formatting Without Graphics Library** — All UI rendering was done manually without LVGL or similar, requiring custom word-wrapping and pagination logic
 - **JSON Parsing on ESP32** — Complex responses were reformatted server-side to reduce client parsing overhead
 - **Color Calibration** — ILI9488 initially displayed inverted RGB values, requiring color correction
-- **Git Security** — Credentials were accidentally committed; we had to rewrite commit history using `git filter-repo`
+- **Git Security** — Credentials were accidentally committed; had to rewrite commit history using `git filter-repo`
 
 ---
 
-## Team & My Contribution
+## License
 
-This was a 4-person group project for CCIT4080. My contributions (Tang Chun Leung / Bryan):
-
-- **Hardware programming** — All ESP32 firmware: menu system, display rendering, GPS integration, API communication, auto-refresh, pagination
-- **UI design** — Button-driven navigation, screen layouts, word-wrapping logic
-- **Debugging** — Hardware troubleshooting, display calibration, end-to-end integration testing
-
----
+This project was developed as part of the CCIT4080 course at HKUSPACE Community College (2024–2025).
 
 ## Acknowledgements
 
