@@ -147,11 +147,11 @@ void loop() {
     }
 
     if (digitalRead(BUTTON_UP) == LOW) {
-        handleUpButton();   // Scroll up / zoom in / prev page
+        handleUpButton();
     }
 
     if (digitalRead(BUTTON_DOWN) == LOW) {
-        handleDownButton(); // Scroll down / zoom out / next page
+        handleDownButton(); 
     }
 }
 ```
